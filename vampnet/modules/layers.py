@@ -154,6 +154,25 @@ class CodebookEmbedding(nn.Module):
 
         latent = torch.cat(latent, dim=1)
         return latent
+    
+    def from_codes2(self, codes: torch.Tensor, codec_weight_list: list):
+        n_codebooks = codes.shape[1]
+        latent = []
+        for i in range(n_codebooks):
+            c = codes[:, i, :]
+
+            lookup_table = codec_weight_list[i]
+            if hasattr(self, "special"):
+                special_lookup = torch.cat(
+                    [self.special[tkn][i : i + 1] for tkn in self.special], dim=0
+                )
+                lookup_table = torch.cat([lookup_table, special_lookup], dim=0)
+
+            l = F.embedding(c, lookup_table).transpose(1, 2)
+            latent.append(l)
+
+        latent = torch.cat(latent, dim=1)
+        return latent
 
     def forward(self, latents: torch.Tensor):
         """

@@ -1,12 +1,12 @@
 import math
 import logging
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, pack, unpack
 import loralib as lora
 import audiotools as at
 
@@ -525,7 +525,9 @@ class VampNet(at.ml.BaseModel):
 
         out = self.classifier(out, cond)
 
-        out = rearrange(out, "b (p c) t -> b p (t c)", c=self.n_predict_codebooks)
+        # out = rearrange(out, "b (p c) t -> b p (t c)", c=self.n_predict_codebooks)
+        # ThomasLee
+        out = rearrange(out, "b (p c) t -> b p c t", c=self.n_predict_codebooks)
 
         return out
     
@@ -767,6 +769,87 @@ class VampNet(at.ml.BaseModel):
             return sampled_z
 
 
+    # ThomasLee
+    @torch.no_grad()
+    def generate2(
+        self,
+        codec_weight_list: List[torch.Tensor] = None,
+        input_tokens: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        sampling_steps: int = 24,
+        temperature: Union[float, Tuple[float, float]] = 2.5,
+    ):
+        device = input_tokens.device
+        assert input_tokens.size() == mask.size(), f"mismatched shape"
+        batch_size = input_tokens.size(0)
+        # mask
+        # output_tokens: [batch_size, num_quantizers, seq_len]
+        output_tokens = input_tokens.clone()
+        result_tokens = output_tokens.masked_fill(mask.bool(), self.mask_token)
+        # num_mask_tokens_at_start: [batch_size, 1]
+        num_mask_tokens_at_start = mask.sum(dim=(-2, -1))
+        num_mask_tokens_at_start = num_mask_tokens_at_start[..., None]
+
+        # sampling
+        for i in range(sampling_steps):
+            progress = (i + 1) / sampling_steps
+            # ThomasLee: batch compatibility
+            r = scalar_to_batch_tensor(progress, batch_size).to(device)
+            r = r[..., None]
+
+            # get latents: [batch_size, num_quantizers * latend_dim, seq_len]
+            latents = self.embedding.from_codes2(result_tokens, codec_weight_list)
+            # forward: [batch_size, logits, num_quantizers, seq_len]
+            logits = self.forward(latents, r)
+            batch_size, num_classes, num_quantizers, seq_len = logits.size()
+            # probs
+            probs = torch.softmax(logits, dim=1)
+            # rearrange for sampling
+            probs = rearrange(probs, "b c q s -> b q s c")
+            probs = rearrange(probs, "b q s c -> (b q s) c")
+            # sample: [batch_size * num_quantizers * seq_len]
+            sampled_tokens = torch.multinomial(probs, 1).squeeze(-1)
+            # restore shapes
+            sampled_tokens = rearrange(
+                sampled_tokens,
+                "(b q s) -> b q s",
+                b=batch_size,
+                q=num_quantizers,
+                s=seq_len,
+            )
+            probs = rearrange(
+                probs, "(b q s) c -> b q s c", b=batch_size, q=num_quantizers, s=seq_len
+            )
+            # get confidences: [batch_size, num_quantizers, seq_len]
+            selected_probs = torch.take_along_dim(
+                probs, sampled_tokens.long().unsqueeze(-1), dim=-1
+            ).squeeze(-1)
+            # assign back for unmasked tokens
+            sampled_tokens = torch.where(mask.bool(), sampled_tokens, result_tokens)
+            # assign inf for unmasked tokens
+            selected_probs = torch.where(mask.bool(), selected_probs, torch.inf)
+            # get the number of tokens to mask
+            num_to_mask = torch.floor(_gamma(r) * num_mask_tokens_at_start).long()
+            # correct
+            if i != (sampling_steps - 1):
+                tmp_num_masked_tokens = mask.sum(dim=(-2, -1)) - 1
+                tmp_num_masked_tokens = tmp_num_masked_tokens[..., None]
+                num_to_mask = torch.maximum(
+                    # ThomasLee: make dim compatible
+                    torch.ones_like(num_to_mask),
+                    torch.minimum(tmp_num_masked_tokens, num_to_mask),
+                )
+            # update mask according to probs
+            mask = mask_by_random_topk(
+                num_to_mask, selected_probs, temperature * (1 - r)
+            )
+            # reshape
+            mask = rearrange(mask, "b (q s) -> b q s", q=num_quantizers, s=seq_len)
+            # update tokens
+            result_tokens = torch.where(mask.bool(), self.mask_token, sampled_tokens)
+        # return
+        return result_tokens
+
 def mask_by_random_topk(num_to_mask: int, probs: torch.Tensor, temperature: float = 1.0):
     """
     Args:
@@ -779,6 +862,9 @@ def mask_by_random_topk(num_to_mask: int, probs: torch.Tensor, temperature: floa
     logging.debug(f"probs shape: {probs.shape}")
     logging.debug(f"temperature: {temperature}")
     logging.debug("")
+
+    # ThomasLee: rearrange for mask
+    probs, packed_shapes = pack([probs], "b *")
 
     confidence = torch.log(probs) + temperature * gumbel_noise_like(probs)
     logging.debug(f"confidence shape: {confidence.shape}")
@@ -796,6 +882,9 @@ def mask_by_random_topk(num_to_mask: int, probs: torch.Tensor, temperature: floa
     # mask out the tokens
     mask = confidence < cut_off
     logging.debug(f"mask shape: {mask.shape}")
+
+    # ThomasLee: restore
+    (probs,) = unpack(probs, packed_shapes, "b *")
 
     return mask
 

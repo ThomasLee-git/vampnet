@@ -45,3 +45,6 @@ class NoamScheduler:
         for p in self.optimizer.param_groups:
             p["lr"] = self.lr
 
+    # ThomasLee
+    def get_lr(self):
+        return [group['lr'] for group in self.optimizer.param_groups]

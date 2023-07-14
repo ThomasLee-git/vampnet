@@ -1,0 +1,23 @@
+{
+    "training_config": {
+        "batch_size": 6,
+        "num_epochs": 200,
+        "save_steps": 1024,
+        "eval_steps": 256,
+        "gradient_accumulation_steps": 32,
+        "model_dir": "checkpoints/preprocessed_vampnet",
+        "summarywriter_root": "tensorboard/preprocessed_vampnet",
+        "constant_seed": false,
+        "checkpoint_config": null
+    },
+    "vampnet": {
+        "config_path": "conf/vampnet_config.yaml"
+    },
+    "dataset_config": {
+        "config": {
+            "npz_path": "./data/musicgen_encodec_codes_9w.npz",
+            "target_frame_len": 1500,
+            "target_num_quantizers": 4
+        }
+    }
+}
